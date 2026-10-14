@@ -2,6 +2,7 @@
 #include "strata/kernels/elementwise.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
@@ -211,7 +212,7 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
-    while (*flag != want) __nanosleep(100);
+    while (*flag != want) strata_spin_pause();   // __nanosleep from sm_70; below it the loop spins (dp4a.hpp)
     __threadfence_system();
 }
 

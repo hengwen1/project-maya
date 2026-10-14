@@ -55,6 +55,11 @@ __device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
     const __half d = ((const __half*) (rec + kv))[(4 * c4) >> 5];
 #if defined(STRATA_USE_HIP)
     if (!lat8_normal(d)) return lat8_q4_f32(w, __half2float(d));
+#elif defined(STRATA_EXPERIMENTAL_SM60)
+    // Pascal (sm_6x): FP16 arithmetic runs at 1/64 the F32 rate, so every record converts through the F32
+    // product - bit-identical to the FP16 path on NVIDIA (glm_lat8_test.cu: every code x every finite scale,
+    // checked on a V100, 0 differ), only cheaper there.
+    return lat8_q4_f32(w, __half2float(d));
 #endif
     return lat8_q4(w, __half2half2(d));
 }
@@ -67,6 +72,9 @@ __device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
         const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
         return make_uint4(lo.x, lo.y, hi.x, hi.y);
     }
+#elif defined(STRATA_EXPERIMENTAL_SM60)
+    const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
+    return make_uint4(lo.x, lo.y, hi.x, hi.y);
 #endif
     const uint2 lo = lat8_q4(w.x, __half2half2(d)), hi = lat8_q4(w.y, __half2half2(d));
     return make_uint4(lo.x, lo.y, hi.x, hi.y);

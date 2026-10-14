@@ -63,6 +63,7 @@ if(STRATA_ENABLE_CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
+  option(STRATA_EXPERIMENTAL_SM60 "experimental build for GPUs below compute capability 7.5: Pascal sm_60/sm_61 (Tesla P40), Volta sm_70 (V100)" OFF)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
   endif()
@@ -70,16 +71,31 @@ if(STRATA_ENABLE_CUDA)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
     # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
+    # Pre-sm_75 is refused unless STRATA_EXPERIMENTAL_SM60 is on.
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 75)
+    # STRATA_EXPERIMENTAL_SM60: a Pascal (sm_60 P100 / sm_61 P40) or Volta (sm_70, V100) build.  The GLM path is
+    # measured on V100s, so sm_70 runs as before; sm_6x needs a CUDA 12.x toolkit (CUDA 13 dropped Pascal and
+    # Volta) and compiles the pre-sm_70 code paths in: the doorbell waits spin instead of __nanosleep
+    # (kernels/dp4a.hpp) and the INT8 latent records convert through the F32 product (glm_lat8.cuh), bit-identical
+    # to the FP16 path on NVIDIA (glm_lat8_test.cu: every code x every finite scale, 0 differ on a V100).
+    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
-        "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+        "Maya needs an NVIDIA GPU of compute capability 7.0 or newer (V100 / RTX 20 and newer), but "
+        "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.  (A Pascal sm_60 / sm_61 or Volta sm_70 "
+        "build is -DSTRATA_EXPERIMENTAL_SM60=ON.)")
+    endif()
+    if(_base LESS 60)
+      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': even the experimental build "
+                          "needs compute capability 6.0 (sm_60) or newer")
     endif()
   endforeach()
+  if(STRATA_EXPERIMENTAL_SM60)
+    # every target sees it: the Pascal / Volta code paths are compiled into this build only, so a build without
+    # the flag keeps exactly the code it had
+    add_compile_definitions(STRATA_EXPERIMENTAL_SM60=1)
+  endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   # CMake links CUDA code with the static runtime (CMAKE_CUDA_RUNTIME_LIBRARY's default); on Windows the same runtime
   # must be named here too - MSVC's linker refuses cudart_static.lib and cudart.lib (the DLL's) in one program,
