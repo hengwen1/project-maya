@@ -37,6 +37,15 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 }
 #endif
 
+// __grid_constant__ (a kernel's by-value struct argument in grid-constant memory, reads optimize) exists from
+// sm_70: below it the annotation is dropped - the arguments are const anyway, only the compiler's knowledge of
+// their address space is lost (nvcc refuses the annotation in an sm_61 pass, so the P40 build needs this).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#define STRATA_GRID_CONSTANT __grid_constant__
+#else
+#define STRATA_GRID_CONSTANT
+#endif
+
 namespace strata::kernels::glmf {
 namespace {
 
@@ -1176,7 +1185,7 @@ __device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
 #endif
 }
 
-__global__ void __launch_bounds__(256) mv_kernel(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1192,7 +1201,7 @@ __global__ void __launch_bounds__(256) mv_kernel(const __grid_constant__ MvBatch
 
 // ... several columns (a verify window's tokens) of a type the tiled kernels below do not take, or every type with
 // STRATA_GLM_MV_TILED=0: kernels of their own, so the one-column kernels keep their registers and their speed
-__global__ void __launch_bounds__(256) mv_kernel_cols(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_cols(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1221,7 +1230,7 @@ __global__ void __launch_bounds__(256) mv_kernel_cols(const __grid_constant__ Mv
 // ... the same for jobs of ONE quantized type: compiled for that type alone (the switch over every type costs the
 // generic kernel registers and occupancy - a Q6_K 8192 x 4096 GEMV on a V100: 53.4 -> 47.8 us, the same arithmetic)
 template<int T>
-__global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1236,7 +1245,7 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBat
     if (lane == 0) J.y[row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
 }
 template<int T>
-__global__ void __launch_bounds__(256) mv_kernel_t_cols(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t_cols(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     const int bid = blockIdx.x;
     int ji = 0;
@@ -1335,7 +1344,7 @@ __device__ __forceinline__ void any_row_dot_nt(int type, const void* w, int row,
     }
 }
 template<int NT>
-__global__ void __launch_bounds__(256) mv_kernel_nt(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_nt(const STRATA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -1353,7 +1362,7 @@ __global__ void __launch_bounds__(256) mv_kernel_nt(const __grid_constant__ MvBa
     }
 }
 template<int T, int NT>
-__global__ void __launch_bounds__(256) mv_kernel_t_nt(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mv_kernel_t_nt(const STRATA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -1380,7 +1389,7 @@ __global__ void __launch_bounds__(256) mv_kernel_t_nt(const __grid_constant__ Mv
 // column's bit for bit (the order differs) - the same value to float rounding.
 constexpr int MMA_W = 8;   // warps a block
 
-__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const STRATA_GRID_CONSTANT MvBatch b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
@@ -1465,7 +1474,7 @@ __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const __grid_constant
 // m16n8k32, then its scale and min in float (the min against the block's int8 sum, as the dp4a kernel).  A lane's eight k slots are eight
 // consecutive values - one 8-byte load of the packed pair of sub-blocks, the activations in the same order.  The
 // dp4a kernel re-reads every column's activations for each pair of rows (8 columns: ~half the memory's speed)
-__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const STRATA_GRID_CONSTANT MvBatch b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
@@ -1569,7 +1578,7 @@ constexpr int MVC_R = 4;   // rows a warp - 2 for Q8_0 / Q4_K from 8 columns (fo
 constexpr int mvc_rows(int type, int nc) { return nc >= 8 && type != 14 ? 2 : MVC_R; }
 
 template<int T, int NC, int R = mvc_rows(T, NC)>
-__global__ void __launch_bounds__(256) mvc_kernel_t(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mvc_kernel_t(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     using Fm = F<T>;
     using D = DecW<T>;
@@ -1666,7 +1675,7 @@ bool mma_ok() {
 // ... BF16 weights against float activations (the routers, the indexer's projections): the same staging, in floats
 constexpr int MVC_FTILE = 512;   // floats of every column per tile
 
-__global__ void __launch_bounds__(256) mvc_kernel_bf16(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTANT MvBatch b) {
     if (b.skip != nullptr && *b.skip) return;
     extern __shared__ __align__(16) uint8_t mvc_smem[];
     float* sx = (float*) mvc_smem;   // [ncol][MVC_FTILE]
@@ -1840,7 +1849,7 @@ __device__ __forceinline__ void bf16_rows_rdna(const uint16_t* row, const float*
 // big Q6_K GEMVs instead of a second, 36-block launch behind them).  A Q6_K job's block holds WPB waves of R rows, a
 // BF16 job's WPB waves of one row; the dispatcher puts the BF16 jobs first so their long-K rows start early.
 template<int R, int NT, int U, int WPB, bool XL>
-__global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const __grid_constant__ MvBatch b) {
+__global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
     const int bid = blockIdx.x;
     int ji = 0;
     while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
@@ -1908,7 +1917,7 @@ constexpr int HC_CHUNK = 512;
 constexpr int HC_THREADS = 256;
 constexpr int HC_MIX = 24;      // (2 + hc) * hc for hc = 4
 
-__global__ void __launch_bounds__(HC_THREADS) hc_kernel(const __grid_constant__ HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2034,7 +2043,7 @@ __device__ __forceinline__ void grid_barrier(unsigned long long* ctr, unsigned i
     __syncthreads();
 }
 
-__global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__ HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const int hc_dim = hc * n_embd;
@@ -2150,7 +2159,7 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
 // 32 blocks of 128 embedding values; n_embd == 4096 only.
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__ HcArgs a) {
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const unsigned int nb = gridDim.x;   // 32
@@ -2311,7 +2320,7 @@ __global__ void embed_streams_kernel(const float* __restrict__ emb, float* __res
 }
 
 // ---------------------------------------------------------------- KDA
-__global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ KdaPrepArgs a) {
+__global__ void __launch_bounds__(128) kda_prep_kernel(const STRATA_GRID_CONSTANT KdaPrepArgs a) {
     const int h = blockIdx.x, role = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int hd = a.head_dim;
     const int d_inner = a.n_head * hd;
@@ -2447,7 +2456,7 @@ __device__ __forceinline__ void lat_put(uint16_t* lat, int64_t row, float y, boo
         lat[(size_t) kv_lora * row + c] = lat_h(y);
 }
 // ---------------------------------------------------------------- DSA
-__global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ DsaPrepArgs a) {
+__global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTANT DsaPrepArgs a) {
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x == 0) {
@@ -2925,7 +2934,7 @@ struct RouteArgs {
                                 // weights is below this (0: none)
 };
 
-__global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
+__global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
     const int tid = threadIdx.x, lane = tid & 31;
     // a token past a wrong draft (set_skip): every expert not in VRAM is left out - no fetch, no CPU work, no counts
     const bool skipped = a.skip != nullptr && *a.skip;
@@ -4796,7 +4805,7 @@ namespace {
 constexpr int kWinEnt = kMaxWinTokens * 8;
 
 // the entries grouped by expert slot (in order of first appearance), each group's members in entry order (t * 8 + i)
-__global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
+__global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     if (threadIdx.x != 0) return;
     unsigned long long gp[kWinEnt];
     int cnt[kWinEnt], gof[kWinEnt], fill[kWinEnt + 1];
@@ -4831,7 +4840,7 @@ __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
 // grid (n_ff / GU_ROWS, groups): a group's expert's gate / up rows of this chunk against each member's FFN input, the
 // clamped swiglu into the member's h (moe_gate_up_kernel's rows, arithmetic and layout per member)
 template<int TG>
-__global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const __grid_constant__ MoeWin w) {
+__global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     const int g = blockIdx.y, chunk = blockIdx.x;
     if (g >= *w.n_groups) return;
     constexpr int NW = GU_WARPS;
@@ -4875,7 +4884,7 @@ __global__ void __launch_bounds__(GU_WARPS * 32) moe_win_gu_kernel(const __grid_
 // grid (n_embd / DOWN_ROWS, groups): a group's expert's down rows of this chunk against each member's h (a warp a
 // member, moe_down_kernel's rows and arithmetic) into the member's partial rows
 template<int TD>
-__global__ void __launch_bounds__(256) moe_win_down_kernel(const __grid_constant__ MoeWin w) {
+__global__ void __launch_bounds__(256) moe_win_down_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     const int g = blockIdx.y;
     if (g >= *w.n_groups) return;
     constexpr int NR = DOWN_ROWS;
@@ -4901,7 +4910,7 @@ __global__ void __launch_bounds__(256) moe_win_down_kernel(const __grid_constant
 
 // each token's output rows: its entries' partials in plan order, the host's disk answer, the shared expert (moe_down's
 // combine)
-__global__ void moe_win_combine_kernel(const __grid_constant__ MoeWin w) {
+__global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     const int t = blockIdx.y;
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= w.n_embd) return;

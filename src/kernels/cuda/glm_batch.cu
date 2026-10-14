@@ -771,6 +771,14 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
 }
 
 #if !defined(STRATA_USE_HIP)
+// The WMMA half API exists only from sm_70 (crt/mma.h guards it on __CUDA_ARCH__): a Pascal (sm_60 / sm_61) build
+// compiles the two tensor-core kernels below to a trap.  The tc_ok dispatch in mla_attn picks them on sm_70+ only
+// and keeps the F32 kernel on a Pascal card - the trap is never launched, it just lets the sm_61 pass compile.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#define STRATA_GLM_WMMA70 1
+#else
+#define STRATA_GLM_WMMA70 0
+#endif
 // The same attention on the tensor cores (sm_70+): block = (token, 16 heads), 8 warps.  The token's cells are walked
 // in chunks of 32: their latent rows go to FP16 in shared memory, the scores S = Q16 . L^T come from the tensor cores
 // (two 16-cell tiles, the K = 512 split in four quarters across the warps and summed), the softmax is the online one
@@ -784,6 +792,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
                                                           const int* __restrict__ cells_all,
                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                           float scale, float* __restrict__ ctx, bool q8) {
+#if STRATA_GLM_WMMA70
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -892,6 +901,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? sO[i] / L : 0.0f;
     }
+#else
+    __trap();   // never launched: the tc_ok dispatch keeps the F32 kernel below sm_70
+#endif
 }
 
 // The same tensor-core attention with the context O in the wmma accumulator registers (four 16-wide column tiles a
@@ -905,6 +917,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                               float scale, float* __restrict__ ctx, bool q8) {
+#if STRATA_GLM_WMMA70
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -1025,6 +1038,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? o[i] / L : 0.0f;
     }
+#else
+    __trap();   // never launched: the tc_ok dispatch picks this kernel on sm_75+ only
+#endif
 }
 
 // The same attention on Ampere and newer (sm_80+: mma.sync m16n8k16 and ldmatrix), FlashAttention-2 style: block =

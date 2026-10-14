@@ -61,6 +61,19 @@ namespace mmq = strata::prefill::mmq;
 
 namespace {
 
+// B.out16 (the KDA recurrence's FP16 rows) widened for the FP32 dense GEMM (STRATA_DENSE_F32): one thread per
+// value, 2-byte loads, 4-byte stores (about 2600 rows x 10K values a sub-batch: well under a millisecond on a P40).
+__global__ void x16_widen_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, long long n) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(__ushort_as_half(src[i]));
+}
+
+void x16_widen(const uint16_t* src, float* dst, int64_t n, cudaStream_t s) {
+    x16_widen_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(src, dst, n);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "x16_widen: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
 // the RAM free now (MemAvailable and ZFS's reclaimable ARC; Windows: the smaller of free RAM and free commit), 0 when
 // unknown
 int64_t avail_ram_bytes() {
@@ -1290,8 +1303,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     };
     // Y[t][N] = X16[t][K] . deq(W)[N][K]^T (tensor cores, F32 accumulate); beta = 1 adds to Y.  A BF16 weight (a
     // projection the GGUF keeps unquantized) is narrowed to FP16 the same way
-    const auto hgemm_q = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy, int Tn,
-                             float beta) {
+    // STRATA_DENSE_F32=1 (a Pascal switch, opt-in, Strata's own): the dense projections' GEMMs as cublasSgemm on
+    // FP32 copies - on sm_61 cuBLAS picks its slow FP16-operand kernels at most sizes (4.3-4.6 against 8.4-10
+    // TFLOPS for Sgemm; Strata's 2026-10-12 Tesla P40 profile), so the weights dequantize straight to F32 and the
+    // GEMM runs on the FP32 cores, the same sums bitwise.
+    static const bool dense_f32 = [] {
+        const char* v = getenv("STRATA_DENSE_F32");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    const auto hgemm_q = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, const float* X, int ldx, float* Y,
+                             int ldy, int Tn, float beta) {
 #if defined(STRATA_USE_HIP)
         if (!S->lt_tried) {
             S->lt_tried = true;
@@ -1310,6 +1331,25 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the decode once + cuBLAS beat exl3::gemm_rows, which decodes again for every 32 rows: KDA projections 2.3 vs
         // 3.3 s over 9 GPUs for a 6.4K-token prompt)
         const bool x3w = w.type == strata::kernels::exl3::kTypeEXL3;
+        if (dense_f32 && !x3w) {
+            const int64_t rows32 = std::max<int64_t>(1, std::min<int64_t>(N, S->w32_elems / Kd));
+            const float* xf = X;
+            if (xf == nullptr) {   // B.out16 (the KDA recurrence's FP16 rows): widened into the idle w16 scratch
+                xf = reinterpret_cast<const float*>(S->w16);
+                x16_widen(X16, reinterpret_cast<float*>(S->w16), (int64_t) Tn * Kd, s);
+            }
+            for (int r0 = 0; r0 < N; r0 += rows32) {
+                const int n = (int) std::min(rows32, (int64_t) (N - r0));
+                if (w.type == gf::kTypeBF16)
+                    gb::bf16_to_f32((const uint16_t*) w.q + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
+                else
+                    strata::kernels::dequant_f32(w.type, w.q, r0, n, Kd, S->w32, s);
+                blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w32, Kd, xf, ldx, &beta,
+                                    Y + r0, ldy),
+                        "sgemm f32");
+            }
+            return;
+        }
         int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
         if (x3w) rows = std::max(128, rows / 128 * 128);
         for (int r0 = 0; r0 < N; r0 += rows) {
@@ -1695,9 +1735,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (Ly.recr) {
                 Carve c{S->uni};
                 KdaBufs B = carve_kda(c, (size_t) tn, g);
-                hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
-                hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
-                hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
+                hgemm_q(Ly.q, DI, E, x16, xs, E, B.proj[0], DI, tn, 0.0f);
+                hgemm_q(Ly.k, DI, E, x16, xs, E, B.proj[1], DI, tn, 0.0f);
+                hgemm_q(Ly.v, DI, E, x16, xs, E, B.proj[2], DI, tn, 0.0f);
                 sgemm_bf16(Ly.f_a, HD, E, xs, E, B.fa, HD, tn, 1.0f);
                 sgemm_bf16(Ly.g_a, HD, E, xs, E, B.ga, HD, tn, 1.0f);
                 sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f);
@@ -1712,14 +1752,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
                             state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 S->mark("kda_rec", s);
-                if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, nullptr, DI, mixer, E, tn, 0.0f);
             } else {
                 Carve c{S->uni};
                 DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
                 const int pt = (int) (p0 + t0);
                 const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
-                hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
-                hgemm_q(Ly.kv_a, g.kv_lora, E, x16, E, B.kv_raw, g.kv_lora, tn, 0.0f);
+                hgemm_q(Ly.q_a, g.q_lora, E, x16, xs, E, B.qr_raw, g.q_lora, tn, 0.0f);
+                hgemm_q(Ly.kv_a, g.kv_lora, E, x16, xs, E, B.kv_raw, g.kv_lora, tn, 0.0f);
                 sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
                 sgemm_bf16(Ly.idx_gate, g.idx_key, E, xs, E, B.ig_raw, g.idx_key, tn, 1.0f);
                 sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn, prescale);
@@ -1759,9 +1799,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::dsa_pool(state_ + dsa_ik_[(size_t) il], state_ + dsa_ig_[(size_t) il], Ly.ape,
                                  state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
                                  ik_ring_);
-                hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
+                hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, B.qr, g.q_lora, B.q, g.n_head * g.qk_nope, tn,
+                        0.0f);
                 if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
-                    hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
+                    hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, B.qr, g.q_lora, B.iq,
                             g.idx_heads * g.idx_key, tn, 0.0f);
                 else
                     sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
@@ -1840,7 +1881,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
                 if (!skip_output)
-                    hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
+                    hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, B.attn, g.n_head * g.v_head, mixer, E, tn,
+                            0.0f);
                 if (t0 + tn == T) {
                     const std::string Ls = std::to_string(il);
                     dump_row("dsa_qr-" + Ls, B.qr, g.q_lora, tn - 1);
@@ -1883,10 +1925,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 Carve c{S->uni};
                 DenseBufs B = carve_dense(c, (size_t) tn, g);
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
-                hgemm_q(Ly.ffn_gate, g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
-                hgemm_q(Ly.ffn_up, g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
+                const float* xs = S->x + (size_t) t0 * E;
+                hgemm_q(Ly.ffn_gate, g.n_ff_dense, E, x16, xs, E, B.dg, g.n_ff_dense, tn, 0.0f);
+                hgemm_q(Ly.ffn_up, g.n_ff_dense, E, x16, xs, E, B.du, g.n_ff_dense, tn, 0.0f);
                 gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
-                hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+                hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, nullptr, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn,
+                        0.0f);
             }
             S->mark("dense_ffn", s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
@@ -1900,10 +1944,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int t0 = 0, shs = S->sh_sub(); t0 < T; t0 += shs) {
             const int tn = std::min(shs, T - t0);
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
-            hgemm_q(Ly.sh_gate, FF, E, x16, E, M.sh_g, FF, tn, 0.0f);
-            hgemm_q(Ly.sh_up, FF, E, x16, E, M.sh_u, FF, tn, 0.0f);
+            const float* xs = S->x + (size_t) t0 * E;
+            hgemm_q(Ly.sh_gate, FF, E, x16, xs, E, M.sh_g, FF, tn, 0.0f);
+            hgemm_q(Ly.sh_up, FF, E, x16, xs, E, M.sh_u, FF, tn, 0.0f);
             gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
-            hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+            hgemm_q(Ly.sh_down, E, FF, M.sh16, nullptr, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
         }
         S->mark("shexp", s);
         sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
@@ -2748,9 +2793,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
             gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
             gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
-            hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
+            hgemm_q(Ly.eh, E, 2 * E, cat16, nullptr, 2 * E, hid, E, Tv, 0.0f);
             gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
-            hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
+            hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, S->x, E, kv, g.kv_lora, Tv, 0.0f);
             sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
             sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
             gb::DsaPrepArgs d;

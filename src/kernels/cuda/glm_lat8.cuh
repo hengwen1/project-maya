@@ -73,8 +73,10 @@ __device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
         return make_uint4(lo.x, lo.y, hi.x, hi.y);
     }
 #elif defined(STRATA_EXPERIMENTAL_SM60)
-    const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
-    return make_uint4(lo.x, lo.y, hi.x, hi.y);
+    {   // braced: the tail below declares lo / hi in this scope too
+        const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
+        return make_uint4(lo.x, lo.y, hi.x, hi.y);
+    }
 #endif
     const uint2 lo = lat8_q4(w.x, __half2half2(d)), hi = lat8_q4(w.y, __half2half2(d));
     return make_uint4(lo.x, lo.y, hi.x, hi.y);

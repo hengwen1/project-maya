@@ -1720,6 +1720,10 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     archs = meta.get("archs") or pc["archs"]
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
+             # ggml's default fatbin compression ("size") needs a driver of CUDA 12.8+ to decompress; on an older
+             # driver every kernel image fails to load ("device kernel image is invalid") and the encoder silently
+             # falls back to the CPU.  Compression is off: the binary grows a few MB, the images always load.
+             "-DGGML_CUDA_COMPRESSION_MODE=none",
              "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
              f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
              *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]

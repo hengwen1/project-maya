@@ -1178,19 +1178,50 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
         const char* v = getenv("STRATA_GLM_DFLASH_ATTN");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    const bool split = split_opt && (m.n_head / m.n_kv) * B <= kAttnQ;
+    bool split = split_opt && (m.n_head / m.n_kv) * B <= kAttnQ;
     const int chunks = (nk_max + kAttnKeys - 1) / kAttnKeys;
     const int per_split = (chunks + kAttnSplits - 1) / kAttnSplits * kAttnKeys;
     const int splits = (nk_max + per_split - 1) / per_split;
     if (!split && smem > 48 * 1024) {
-        static bool once = false;
-        if (!once) {
-            once = true;
-            cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+        // attn_kernel wants nk_max floats of dynamic shared memory; over the default 48 KB the launch needs the
+        // kernel's shared-memory opt-in, whose ceiling differs by card: Pascal has none (48 KB is its maximum, so
+        // a bigger window never fits), Turing 64 KB, Volta 96 KB.  Per device: the ceiling and how far the
+        // attribute was raised already (the window fills over a block's drafts, so it only grows).  A window over
+        // the ceiling goes to the split attention when its shape allows (STRATA_GLM_DFLASH_ATTN=0 included: a
+        // working draft beats the A/B), else the draft is refused with the reason.
+        static size_t ceiling[16] = {};   // 0 not queried yet, else cudaDevAttrMaxSharedMemoryPerBlockOptin
+        static size_t raised[16] = {};    // the MaxDynamicSharedMemorySize already set for attn_kernel
+        const int dv = m.dev >= 0 && m.dev < 16 ? m.dev : 0;
+        if (ceiling[dv] == 0) {
+            int v = 0;
+            if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dv) != cudaSuccess || v <= 0)
+                v = 48 * 1024;
+            cudaGetLastError();
+            ceiling[dv] = (size_t) v;
         }
-        if (smem > 96 * 1024) {
-            err = "glm dflash: a window of " + std::to_string(nk_max) + " keys";
-            return false;
+        if (smem > ceiling[dv]) {
+            if ((m.n_head / m.n_kv) * B <= kAttnQ) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "glm dflash: a window of %d keys wants %zu KB of shared memory, over this "
+                                         "card's %zu KB - the split attention instead\n", nk_max, smem / 1024,
+                                 ceiling[dv] / 1024);
+                }
+                split = true;
+            } else {
+                err = "glm dflash: a window of " + std::to_string(nk_max) + " keys wants " +
+                      std::to_string((smem + 1023) / 1024) + " KB of shared memory, over this card's " +
+                      std::to_string(ceiling[dv] / 1024) + " KB, and the split attention does not fit " +
+                      std::to_string((m.n_head / m.n_kv) * B) + " queries a kv head (kAttnQ " +
+                      std::to_string(kAttnQ) + ")";
+                return false;
+            }
+        } else if (raised[dv] < smem) {
+            if (!ck(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem),
+                    "the draft attention's shared-memory opt-in", err))
+                return false;
+            raised[dv] = smem;
         }
     }
     for (int il = 0; il < m.n_layer; ++il) {

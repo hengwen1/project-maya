@@ -182,9 +182,10 @@ __global__ void dequant_q8_0_f16_kernel(const uint8_t* __restrict__ blocks, int6
     out[i] = make_uint4(h[0], h[1], h[2], h[3]);
 }
 
-// Q4_K / Q5_K / Q6_K -> f16 the same way: 8 values (a quarter of one 32-value group) a thread, one 16-byte store; the
-// expressions are group32's, value for value.  (The prompt path's KDA/DSA projections are Q5_K: ~2 s of a 2.6k prompt
-// per GPU went to the generic kernel; a Q4_K attention cost 13-19% of prefill there.)
+// Q4_K / Q5_K / Q6_K / IQ4_XS -> f16 the same way: 8 values (a quarter of one 32-value group) a thread, one 16-byte
+// store; the expressions are group32's, value for value.  (The prompt path's KDA/DSA projections are Q5_K: ~2 s of a
+// 2.6k prompt per GPU went to the generic kernel; a Q4_K attention cost 13-19% of prefill there.  Strata's P40
+// profile: Q6_K 7.25 -> 0.33 ms on the Tesla P40.)
 template <int TYPE>
 __global__ void dequant_k_f16_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                                      int64_t runs_per_row, uint4* __restrict__ out) {
@@ -222,7 +223,7 @@ __global__ void dequant_k_f16_kernel(const uint8_t* __restrict__ blocks, int64_t
             const int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
             v[t] = __float2half_rn(d1 * (float) (nib + ((qh[l] & u) ? 16 : 0)) - m1);
         }
-    } else {   // 14: Q6_K
+    } else if constexpr (TYPE == 14) {                             // Q6_K
         const uint8_t* b = blocks + (row0 + r) * row_bytes + (c8 / 32) * 210;
         const int n = gi / 4, qu = gi % 4;
         const uint8_t* ql = b + 64 * n;
@@ -239,6 +240,19 @@ __global__ void dequant_k_f16_kernel(const uint8_t* __restrict__ blocks, int64_t
             else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
             else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
             v[t] = __float2half_rn(d * (float) sc[is + 2 * qu] * (float) (q - 32));
+        }
+    } else {   // 23: IQ4_XS (d scales_h scales_l[4] qs[128], 136 B a block of 256): the run's 8 values sit in one
+        const uint8_t* b = blocks + (row0 + r) * row_bytes + (c8 / 32) * 136;   // 32-value group's nibble pairs
+        const float d = h2f(b);
+        const uint16_t scales_h = (uint16_t) (b[2] | (b[3] << 8));
+        const int ls = ((b[4 + gi / 2] >> (4 * (gi % 2))) & 0xf) | (((scales_h >> (2 * gi)) & 3) << 4);
+        const float dl = d * (float) (ls - 32);
+        const uint8_t* qs = b + 8 + 16 * gi;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int e = l0 + t;
+            const int nib = e < 16 ? (qs[e] & 0xf) : (qs[e - 16] >> 4);
+            v[t] = __float2half_rn(dl * (float) kv_iq4nl[nib]);
         }
     }
     uint32_t h[4];
@@ -313,12 +327,19 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
 
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                  void* stream) {
+    // The wide kernels are bitwise the same output as the generic one (a thread per 8 values against 32);
+    // STRATA_DEQUANT_WIDE=0 falls back to the generic kernel - the A/B for the P40 profile.
+    static const bool wide = [] {
+        const char* v = getenv("STRATA_DEQUANT_WIDE");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
     if (iq_only(ggml_type)) {
         iq_dequant_f16(ggml_type, (const uint8_t*) blocks + (size_t) row0 * iq_row_bytes(ggml_type, cols), rows * cols,
                        out, stream);
         return;
     }
-    if (ggml_type == 8 && cols % 32 == 0 && rows > 0 && ((uintptr_t) out & 15u) == 0 && ((uintptr_t) blocks & 1u) == 0) {
+    if (wide && ggml_type == 8 && cols % 32 == 0 && rows > 0 && ((uintptr_t) out & 15u) == 0 &&
+        ((uintptr_t) blocks & 1u) == 0) {
         const int64_t runs = cols / 8, total = rows * runs;
         dequant_q8_0_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
             (const uint8_t*) blocks, cols / 32 * 34, row0, rows, runs, reinterpret_cast<uint4*>(out));
@@ -326,16 +347,20 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
-    if ((ggml_type == 12 || ggml_type == 13 || ggml_type == 14) && cols % 256 == 0 && rows > 0 &&
-        ((uintptr_t) out & 15u) == 0) {
+    if (wide && (ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 23) && cols % 256 == 0 &&
+        rows > 0 && ((uintptr_t) out & 15u) == 0) {
         const int64_t runs = cols / 8, total = rows * runs,
-                      rb = cols / 256 * (ggml_type == 12 ? 144 : ggml_type == 13 ? 176 : 210);
+                      rb = cols / 256 *
+                           (ggml_type == 12 ? 144 : ggml_type == 13 ? 176 : ggml_type == 23 ? 136 : 210);
         const unsigned grid = (unsigned) ((total + 255) / 256);
         if (ggml_type == 12)
             dequant_k_f16_kernel<12><<<grid, 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rb, row0, rows,
                                                                             runs, reinterpret_cast<uint4*>(out));
         else if (ggml_type == 13)
             dequant_k_f16_kernel<13><<<grid, 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rb, row0, rows,
+                                                                            runs, reinterpret_cast<uint4*>(out));
+        else if (ggml_type == 23)
+            dequant_k_f16_kernel<23><<<grid, 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rb, row0, rows,
                                                                             runs, reinterpret_cast<uint4*>(out));
         else
             dequant_k_f16_kernel<14><<<grid, 256, 0, (cudaStream_t) stream>>>((const uint8_t*) blocks, rb, row0, rows,
