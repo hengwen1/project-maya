@@ -14,8 +14,19 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstring>
 
-int main() {
+int main(int argc, char** argv) {
+    // --caps: run the probe and exit with the capability bits (0-7); the engine's probe() forks + execs
+    // this so a fault here can only ever kill this helper process, never the engine's context.
+    if (argc > 1 && std::strcmp(argv[1], "--caps") == 0) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
+        if (prop.major != 11) return 1;   // only cc 11.x can have Thor UMMA
+        return strata::kernels::tcgen05::selftest(dev) ? 2 : 1;
+    }
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { std::fprintf(stderr, "no CUDA device\n"); return 1; }
     cudaDeviceProp prop{};

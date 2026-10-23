@@ -28,6 +28,11 @@ namespace strata::kernels::tcgen05 {
 unsigned probe(int dev);
 inline bool available(int dev) { return (probe(dev) & 2u) != 0; }
 
+// The known-product check itself, IN THE CALLER'S CONTEXT (a fault here kills it - this is what the
+// external probe process runs; do not call from the engine).  True when a 64x128x16 grouped product
+// matches the CPU reference exactly.
+bool selftest(int dev);
+
 // Grouped GEMM over f16 activations and f16 weights in fp32 accumulation: for expert e, the token rows
 // [bounds[e], bounds[e+1]) of X [tokens, K] (row-major) multiply W_e [n_out, K] (row-major, expert e's
 // matrix at W + e*expert_bytes) into Y [tokens, n_out] (row-major, fp32).  Requires n_out % 128 == 0,

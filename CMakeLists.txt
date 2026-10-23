@@ -311,6 +311,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_TCGEN05)
+    # the probe helper the engine's tcgen05 capability check forks + execs (see docs/THOR.md); built next
+    # to the engine so the /proc/self/exe-relative lookup finds it
+    add_executable(strata-tcgen05-probe tools/thor_tcgen05_probe.cpp)
+    target_compile_options(strata-tcgen05-probe PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-gencode;arch=compute_110a,code=sm_110a>)
+    target_compile_definitions(strata-tcgen05-probe PRIVATE STRATA_TCGEN05=1)
+    target_link_libraries(strata-tcgen05-probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     add_executable(glm_layer_graph_test tests/glm_layer_graph_test.cu)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})

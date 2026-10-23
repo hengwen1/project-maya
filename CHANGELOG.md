@@ -7,13 +7,15 @@ only what changed and starts; the model is not downloaded again.
 ## Unreleased (the jthor branch)
 
 Jetson Thor: the engine's CUDA kernels build for Thor's sm_110 (a CUDA 13.0 floor in the setup and CMake, and an
-aarch64 host fix in the graph's spin-wait), and Thor's UMMA ("tcgen05") tensor-core instructions are wired behind a
-fork-isolated probe with a known-product self-test (`strata::kernels::tcgen05`). On the devkit measured (driver
-595.78, CUDA 13.2) the device refuses every `tcgen05.mma` - cta_group::1 raises an illegal instruction, cta_group::2
-commits without writing TMEM - so the probe keeps MMQ/cuBLAS, and the grouped f16 GEMM (docs/THOR.md) lights up by
-itself the first time hardware executes the self-test. Toolchain findings: `-arch=sm_110a` silently downgrades to
-sm_110 (the tcgen05 source needs its own `-gencode arch=compute_110a,code=sm_110a`), and the PTX ISA 8.6 spellings
-differ from the early sm_100a ones.
+aarch64 host fix in the graph's spin-wait), and Thor's UMMA ("tcgen05") tensor cores are working and verified:
+`strata::kernels::tcgen05::gemm_f16_grouped` multiplies a known grouped product bit-exactly against the CPU on the
+devkit (docs/THOR.md has the encodings - an instruction descriptor from the early sm_100a spellings decodes to N=0
+and faults, the shared-memory descriptor needs version=1 on Blackwell, and the M=64 accumulator lands in TMEM lanes
+(r/16)*32 + r%16). The probe forks and EXECs `strata-tcgen05-probe --caps` (a plain fork's inherited runtime dies at
+the first TMEM op), so a device that cannot execute the instructions only ever kills the helper; the engine keeps
+MMQ/cuBLAS. Toolchain findings: `-arch=sm_110a` silently downgrades to sm_110 (the tcgen05 source needs its own
+`-gencode arch=compute_110a,code=sm_110a`). Wiring the dequant into the MoE kernel (instead of f16-in-global
+weights) is the remaining step to speed up GLM's prompt experts.
 
 ## v1.1.25 - 2026-10-23
 

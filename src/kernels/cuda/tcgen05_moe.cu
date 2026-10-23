@@ -23,6 +23,10 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <unistd.h>
 #if defined(STRATA_TCGEN05) && defined(__linux__)
 #include <sys/wait.h>
 #include <unistd.h>
@@ -32,18 +36,24 @@ namespace strata::kernels::tcgen05 {
 namespace {
 
 // ---- descriptors and layouts (host + device) ----
+// Field layouts from the CUTLASS that ships inside flashinfer 0.7.0 (mma_sm100_desc.hpp) - the same
+// sources of the fused-MoE kernels validated on this Thor - and every value here verified on the device:
 
-// The instruction descriptor for a dense f16 UMMA: D in f32 (c_format 1), both operands f16 K-major,
-// M = 64 (cta_group::1; the bit at 21 would select 128), N = n (encoded /8).
-__host__ __device__ inline uint32_t mma_idesc_f16(int n) {
-    return (1u << 4) | ((uint32_t) (n / 8) << 15);
+// The instruction descriptor for a dense f16 UMMA: D in f32 (c_format 1 at bit 4), both operands f16
+// (a_format/b_format 0 at bits 7-12), K-major (a_major bit 15 / b_major bit 16 clear), N>>3 at bits
+// 17-23, M>>2 at bits 24-29 (4 = M64, 8 = M128).  NOTE the two guards: N < 8 is invalid, and the m_dim
+// field sits at bit 24 - an idesc built with the early sm_100a spellings decodes to N=0 and the device
+// raises an illegal instruction.
+__host__ __device__ inline uint32_t mma_idesc_f16(int m, int n) {
+    return (1u << 4) | ((uint32_t) (n / 8) << 17) | ((uint32_t) (m / 64 * 4) << 24);
 }
 
 // The shared-memory matrix descriptor: start address, leading/stride byte offsets (all /4-encoded),
-// no swizzle, no base offset.
+// no swizzle, no base offset, and version 1 - bit 46 is REQUIRED on Blackwell (zero means the pre-
+// Blackwell encoding and the tensor pipe refuses the whole descriptor).
 __host__ __device__ inline uint64_t smem_desc(uint32_t smem_addr, uint32_t lbo, uint32_t sbo) {
     return (uint64_t) ((smem_addr >> 4) & 0x3FFFu) | ((uint64_t) ((lbo >> 4) & 0x3FFFu) << 16) |
-           ((uint64_t) ((sbo >> 4) & 0x3FFFu) << 32);
+           ((uint64_t) ((sbo >> 4) & 0x3FFFu) << 32) | ((uint64_t) 1 << 46);
 }
 
 // Byte offset of the 16-byte chunk at (row, k16) of a BK/8-core-column tile in the canonical layout.
@@ -171,7 +181,7 @@ __global__ void __launch_bounds__(256) gemm_f16_grouped_kernel(
             mma_f16_cg1(d_tmem,
                         smem_desc((uint32_t) __cvta_generic_to_shared(sa[k & 1]), 128, CORE * 128),
                         smem_desc((uint32_t) __cvta_generic_to_shared(sb[k & 1]), 128, CORE * 128),
-                        mma_idesc_f16(IDN), k != 0);
+                        mma_idesc_f16(BM, IDN), k != 0);
             mma_commit((uint32_t) __cvta_generic_to_shared(&mbar));
         }
         mbar_wait(&mbar, (uint32_t) (k & 1));    // the MMA read both tiles and wrote TMEM
@@ -183,17 +193,23 @@ __global__ void __launch_bounds__(256) gemm_f16_grouped_kernel(
         __syncthreads();
     }
 
-    // epilogue: warps 0 and 1 own TMEM lanes 0-63 - one token row per lane
-    if (tid < 64) {
+    // epilogue: the M=64 D layout (measured on Thor) puts output row r at TMEM lane (r/16)*32 + r%16 -
+    // warp w's sub-partition holds rows w*16..w*16+15 in its lanes 0-15, lanes 16-31 read as zero.
+    // tcgen05.ld is warp-collective: all 32 lanes issue it, the lane<16 half stores.  v[] lives INSIDE the
+    // chunk loop: declared outside, -O3 sank the float4 stores across the async ld iterations and columns
+    // landed on other columns' values (found with a one-hot B; the mma itself was never wrong).
+    if (tid < 128) {
         const int warp = tid / 32, lane = tid % 32;
-        const int row = c0 + warp * 32 + lane;
-        float* y = Y + (size_t) row * ldy + n0;
         for (int c = 0; c < IDN; c += 32) {
             float v[32];
             tmem_ld<32>(v, d_tmem | ((uint32_t) warp * 32u << 16) | (uint32_t) c);
-            const int cols = min(32, IDN - c);
-            for (int j = 0; j < cols; j += 4)
-                *reinterpret_cast<float4*>(y + j) = *reinterpret_cast<const float4*>(v + j);
+            const int r = warp * 16 + lane;
+            if (lane < 16 && r < crow) {   // rows past the expert's last token row stay unwritten
+                float* y = Y + (size_t) (c0 + r) * ldy + n0 + c;
+                const int cols = min(32, IDN - c);
+                for (int j = 0; j < cols; j += 4)
+                    *reinterpret_cast<float4*>(y + j) = *reinterpret_cast<const float4*>(v + j);
+            }
         }
     }
     __syncthreads();
@@ -201,80 +217,91 @@ __global__ void __launch_bounds__(256) gemm_f16_grouped_kernel(
 #endif
 }
 
-// The probe's child: a known 64x8x16 product against the CPU, per cta_group.  Exit bits: 2 = cg1, 4 = cg2.
+// The probe runs in a SEPARATE PROCESS: tools/thor_tcgen05_probe.cpp --caps, which drives the real
+// production kernel (a known product checked against the CPU) and exits with the capability bits.  A
+// fork alone is not enough - the fork-inherited CUDA runtime (its worker threads do not survive the
+// fork) dies at the first TMEM operation on this driver - so the child EXECs the helper: a fresh
+// process, a fresh CUDA state, and an illegal instruction or a fault can only ever kill the helper,
+// never the engine's context.  Found next to the engine (under its /proc/self/exe directory) or via
+// STRATA_TCGEN05_PROBE; without it the device reports incapable and every caller keeps its fallback.
 #if defined(STRATA_TCGEN05) && defined(__linux__)
-constexpr int ST_N = 8, ST_K = 16;
 
-__global__ void __launch_bounds__(128) selftest_kernel(const __half* A, const __half* B, float* D) {
-#if defined(__CUDA_ARCH_FEAT_SM110_ALL)
-    __shared__ __align__(1024) __half sa[64 * ST_K];
-    __shared__ __align__(1024) __half sb[ST_N * ST_K];
-    __shared__ __align__(8) uint64_t mbar;
-    __shared__ uint32_t tmem_base;
-    const int tid = threadIdx.x;
-    for (int i = tid; i < 64 * ST_K; i += blockDim.x) {
-        const int r = i / ST_K, kc = (i % ST_K) / 8, kk = i % 8;
-        sa[interleave_offset(r, kc, ST_K / 8) / 2 + kk] = A[i];
-    }
-    for (int i = tid; i < ST_N * ST_K; i += blockDim.x) {
-        const int r = i / ST_K, kc = (i % ST_K) / 8, kk = i % 8;
-        sb[interleave_offset(r, kc, ST_K / 8) / 2 + kk] = B[i];
-    }
-    if (tid == 0) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"((uint32_t) __cvta_generic_to_shared(&mbar)));
-    __syncthreads();
-    if (tid < 32) tmem_alloc(&tmem_base, 32);
-    __syncthreads();
-    if (tid == 0) {
-        asm volatile("tcgen05.fence::after_thread_sync;");
-        mma_f16_cg1(tmem_base,
-                    smem_desc((uint32_t) __cvta_generic_to_shared(sa), 128, (ST_K / 8) * 128),
-                    smem_desc((uint32_t) __cvta_generic_to_shared(sb), 128, (ST_K / 8) * 128),
-                    mma_idesc_f16(ST_N), 0);
-        mma_commit((uint32_t) __cvta_generic_to_shared(&mbar));
-    }
-    mbar_wait(&mbar, 0);
-    __syncthreads();
-    if (tid < 64) {
-        const int warp = tid / 32, lane = tid % 32;
-        float v[8];
-        tmem_ld<8>(v, tmem_base | ((uint32_t) warp * 32u << 16));
-        for (int c = 0; c < 8; ++c) D[(warp * 32 + lane) * ST_N + c] = v[c];
-    }
-    __syncthreads();
-    if (tid < 32) tmem_dealloc(tmem_base, 32);
-#endif  // __CUDA_ARCH_FEAT_SM110_ALL
-}
-
-int selftest_run() {
-    __half *A, *B;
-    float* D;
-    if (cudaMallocManaged(&A, 64 * ST_K * 2) != cudaSuccess) return 0;
-    if (cudaMallocManaged(&B, ST_N * ST_K * 2) != cudaSuccess) return 0;
-    if (cudaMallocManaged(&D, 64 * ST_N * 4) != cudaSuccess) return 0;
-    for (int i = 0; i < 64 * ST_K; i++) A[i] = __float2half((float) ((i * 7) % 13) - 6.f);
-    for (int i = 0; i < ST_N * ST_K; i++) B[i] = __float2half((float) ((i * 5) % 7) - 3.f);
-    selftest_kernel<<<1, 128>>>(A, B, D);
-    if (cudaDeviceSynchronize() != cudaSuccess) return 0;
-    for (int m = 0; m < 64; m++)
-        for (int n = 0; n < ST_N; n++) {
-            float ref = 0;
-            for (int k = 0; k < ST_K; k++) ref += __half2float(A[m * ST_K + k]) * __half2float(B[n * ST_K + k]);
-            if (D[m * ST_N + n] != ref) return 0;
+unsigned probe_by_helper() {
+    char exe[4096];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return 1;
+    exe[n] = 0;
+    char path[4200];
+    std::snprintf(path, sizeof(path), "%s", exe);
+    char* slash = strrchr(path, '/');
+    const char* env = getenv("STRATA_TCGEN05_PROBE");
+    if (env && *env) {
+        std::snprintf(path, sizeof(path), "%s", env);
+    } else {
+        char dir[4200];
+        if (!slash) std::snprintf(path, sizeof(path), "strata-tcgen05-probe");
+        else {
+            std::snprintf(dir, sizeof(dir), "%.*s", (int) (slash - path), path);
+            std::snprintf(path, sizeof(path), "%s/strata-tcgen05-probe", dir);
         }
-    return 2;
-}
-
-unsigned probe_by_fork() {
-    pid_t p = fork();
-    if (p == 0) _exit(selftest_run());   // _exit: the parent's atexit handlers must not run twice
+    }
+    const pid_t p = fork();
+    if (p == 0) {
+        execl(path, path, "--caps", (char*) nullptr);
+        if (getenv("STRATA_TCGEN05_DEBUG"))
+            std::fprintf(stderr, "probe: exec %s failed: %s\n", path, strerror(errno));
+        _exit(127);   // exec failed: the helper is not there, the device stays "incapable"
+    }
     int st = 0;
     waitpid(p, &st, 0);
-    if (!WIFEXITED(st)) return 1;        // crashed: probed, incapable
-    return 1u | (unsigned) WEXITSTATUS(st);
+    if (!WIFEXITED(st)) return 1;            // the helper crashed: probed, incapable
+    const unsigned code = (unsigned) WEXITSTATUS(st);
+    if (code == 127) return 1;               // the exec itself failed (helper not found)
+    return 1u | (code & 6u);                 // bits 2 = cg1, 4 = cg2 (probed bit added here)
 }
+#else
+
+unsigned probe_by_helper() { return 1; }
+
 #endif
 
+constexpr int ST_ROWS = 64, ST_N = 128, ST_K = 16;
+
+bool selftest_run() {
+    __half *A, *B;
+    float* D;
+    int32_t* bounds;
+    if (cudaMallocManaged(&A, (size_t) ST_ROWS * ST_K * 2) != cudaSuccess) return false;
+    if (cudaMallocManaged(&B, (size_t) ST_N * ST_K * 2) != cudaSuccess) return false;
+    if (cudaMallocManaged(&D, (size_t) ST_ROWS * ST_N * 4) != cudaSuccess) return false;
+    if (cudaMallocManaged(&bounds, 2 * 4) != cudaSuccess) return false;
+    for (int i = 0; i < ST_ROWS * ST_K; i++) A[i] = __float2half((float) ((i * 7) % 13) - 6.f);
+    for (int i = 0; i < ST_N * ST_K; i++) B[i] = __float2half((float) ((i * 5) % 7) - 3.f);
+    bounds[0] = 0;
+    bounds[1] = ST_ROWS;
+    gemm_f16_grouped_kernel<BN><<<dim3(1, 1), 256>>>(A, ST_K, B, (size_t) ST_N * ST_K * 2, bounds, 1, ST_K, D,
+                                                     ST_N);
+    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    if (ok)
+        for (int m = 0; m < ST_ROWS && ok; m++)
+            for (int n = 0; n < ST_N && ok; n++) {
+                float ref = 0;
+                for (int k = 0; k < ST_K; k++)
+                    ref += __half2float(A[m * ST_K + k]) * __half2float(B[n * ST_K + k]);
+                ok = D[m * ST_N + n] == ref;
+                if (!ok && getenv("STRATA_TCGEN05_DEBUG"))
+                    std::fprintf(stderr, "selftest: m=%d n=%d got %g want %g\n", m, n, D[m * ST_N + n], ref);
+            }
+    cudaFree(A);
+    cudaFree(B);
+    cudaFree(D);
+    cudaFree(bounds);
+    return ok;
+}
+
 }  // namespace
+
+bool selftest(int) { return selftest_run(); }
 
 unsigned probe(int dev) {
 #if defined(STRATA_TCGEN05) && defined(__linux__)
@@ -284,7 +311,7 @@ unsigned probe(int dev) {
         int major = 0;
         unsigned caps = 1u;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major == 11)
-            caps = probe_by_fork();
+            caps = probe_by_helper();
         per_dev[dev] = caps;
     }
     return per_dev[dev];
