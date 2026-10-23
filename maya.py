@@ -886,7 +886,8 @@ def check_hip_pc(a, installed=False) -> dict:
 
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
-    lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
+    # Thor (sm_110) needs CUDA 13.0 (JetPack 7); Blackwell 12.8
+    lo = (13, 0) if max(archs) >= 110 else ((12, 8) if max(archs) >= 100 else (12, 0))
     hi = (13, 0) if min(archs) < 75 else None       # CUDA 13 no longer compiles for Volta (sm_70) or Pascal (sm_6x)
     return lo, hi
 
@@ -929,6 +930,10 @@ def toolkit_hint(archs) -> str:
         return ("Volta (V100) and Pascal need CUDA 12.x - Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit "
                 "(CUDA 12.0), "
                 "or NVIDIA's cuda-toolkit-12-8 package: https://developer.nvidia.com/cuda-12-8-0-download-archive")
+    if max(archs) >= 110:
+        return ("Jetson Thor needs the JetPack 7 CUDA toolkit (13.0 or newer; 12.x cannot build for sm_110): "
+                "sudo apt-get install -y cuda-toolkit-13-x, see "
+                "https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html")
     if max(archs) >= 100:
         return "NVIDIA's cuda-toolkit-12-8 (or newer) package: https://developer.nvidia.com/cuda-downloads"
     return ("Ubuntu 24.04: sudo apt-get install -y nvidia-cuda-toolkit (CUDA 12.0), or NVIDIA's packages: "
@@ -1361,7 +1366,10 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
                 "again (it is found by itself), or pass --host-compiler g++-13;") + (
                 "\n       'Unsupported gpu architecture compute_70' (or compute_61) - CUDA 13 cannot build for Volta "
-                "or Pascal, install CUDA 12.x;\n       the compiler killed (out of memory) - close programs and run it "
+                "or Pascal, install CUDA 12.x;"
+                "\n       'Unsupported gpu architecture compute_110' - the toolkit is too old for Jetson Thor (sm_110 "
+                "needs CUDA 13.0+, JetPack 7);"
+                "\n       the compiler killed (out of memory) - close programs and run it "
                 "again "
                 "(it continues)")
         if soft:

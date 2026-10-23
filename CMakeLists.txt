@@ -107,6 +107,39 @@ if(STRATA_ENABLE_CUDA)
       break()
     endif()
   endforeach()
+  # Jetson Thor (sm_110, cc 11.0) needs CUDA 13.0+ (no 12.x toolkit can build for it), and the UMMA
+  # ("tcgen05") instructions only assemble for the arch-specific compute_110a target - which nvcc takes only
+  # through an explicit -gencode: `-arch=sm_110a` is silently downgraded to plain sm_110 by the JetPack 7
+  # toolchains (measured on CUDA 13.2), so the tcgen05 source gets its own -gencode here.  Whether the device
+  # actually executes the instructions is a run-time question - the kernels gate themselves behind a
+  # fork-isolated probe with a known-product self-test (an illegal instruction would poison the whole CUDA
+  # context, so it must never be issued speculatively in the engine's own context) and fall back to the
+  # mma.sync paths when the device refuses them.
+  set(_strata_thor 0)
+  foreach(_a IN LISTS _strata_archs)
+    string(REGEX REPLACE "-.*$" "" _base "${_a}")
+    if(_base MATCHES "^110")
+      set(_strata_thor 1)
+    endif()
+  endforeach()
+  if(_strata_thor)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS "13.0")
+      message(FATAL_ERROR
+        "Maya on Jetson Thor (sm_110) needs CUDA 13.0 or newer (JetPack 7's toolkit); this nvcc is "
+        "${CMAKE_CUDA_COMPILER_VERSION}. maya.py picks the newest toolkit that fits - pass it with --nvcc.")
+    endif()
+    if(NOT DEFINED STRATA_TCGEN05)
+      set(STRATA_TCGEN05 ON)
+    endif()
+  else()
+    set(STRATA_TCGEN05 OFF)
+  endif()
+  if(STRATA_TCGEN05)
+    set_source_files_properties(src/kernels/cuda/tcgen05_moe.cu PROPERTIES
+      COMPILE_OPTIONS "-gencode;arch=compute_110a,code=sm_110a"
+      COMPILE_DEFINITIONS "STRATA_TCGEN05=1")
+    message(STATUS "Maya: Thor tcgen05 kernels compiled for compute_110a")
+  endif()
   # CMake links CUDA code with the static runtime (CMAKE_CUDA_RUNTIME_LIBRARY's default); on Windows the same runtime
   # must be named here too - MSVC's linker refuses cudart_static.lib and cudart.lib (the DLL's) in one program,
   # where Linux's takes the first of the duplicates
@@ -273,6 +306,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/glm_kv_stream.cu
+                          src/kernels/cuda/tcgen05_moe.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)

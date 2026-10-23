@@ -4,6 +4,17 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased (the jthor branch)
+
+Jetson Thor: the engine's CUDA kernels build for Thor's sm_110 (a CUDA 13.0 floor in the setup and CMake, and an
+aarch64 host fix in the graph's spin-wait), and Thor's UMMA ("tcgen05") tensor-core instructions are wired behind a
+fork-isolated probe with a known-product self-test (`strata::kernels::tcgen05`). On the devkit measured (driver
+595.78, CUDA 13.2) the device refuses every `tcgen05.mma` - cta_group::1 raises an illegal instruction, cta_group::2
+commits without writing TMEM - so the probe keeps MMQ/cuBLAS, and the grouped f16 GEMM (docs/THOR.md) lights up by
+itself the first time hardware executes the self-test. Toolchain findings: `-arch=sm_110a` silently downgrades to
+sm_110 (the tcgen05 source needs its own `-gencode arch=compute_110a,code=sm_110a`), and the PTX ISA 8.6 spellings
+differ from the early sm_100a ones.
+
 ## v1.1.25 - 2026-10-23
 
 Several conversations at once on GLM get faster, DeepSeek keeps conversations across switches and restarts, and a
